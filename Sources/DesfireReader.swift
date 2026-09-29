@@ -592,34 +592,45 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
     /// (0x1A) para 3K3DES. Bloques de 8 bytes, misma estructura que AES pero con el IV
     /// del ULTIMO BLOQUE DE 8 del cifrado que enviamos.
     ///
-    /// Con `soloSondear = true` se ejecuta SOLO el primer intercambio: se manda el
-    /// comando y se mira si la tarjeta responde con un reto. Eso revela que familia
-    /// criptografica acepta esa clave SIN enviar ningun criptograma, o sea sin arriesgar
-    /// un fallo de autenticacion. Es la parte gratis: si no la acepta, se prueba la otra
-    /// sin coste.
+    /// Devuelve (aceptado, autenticado):
+    ///   aceptado = false -> la tarjeta no arranco la autenticacion. NO se ha gastado
+    ///                       intento, asi que se puede probar otra familia sin coste.
+    ///   aceptado = true  -> la autenticacion se completo: o el valor por defecto es
+    ///                       correcto (autenticado = true) o no lo es (false, y ahi si
+    ///                       se habra gastado uno de los 3 intentos de esa clave).
     private func authenticateLegacy(_ tag: NFCMiFareTag, ins: UInt8, keyNo: UInt8,
-                                    key: Data, etiqueta: String, soloSondear: Bool,
+                                    key: Data, etiqueta: String, intento: Int = 1,
                                     done: @escaping (Bool, Bool) -> Void) {
         let cmd1 = Data([ins, keyNo])
         let clave = DesfireCrypto.sinBitsDeVersion(key)   // el bit 0 de cada byte es la version
         tag.sendMiFareCommand(commandPacket: cmd1) { resp1, err1 in
-            self.record(name: "\(etiqueta) clave \(keyNo) paso 1", tx: cmd1, rx: resp1,
-                        error: err1?.localizedDescription ?? "")
-            // Estado al principio: 0xAF = "la autenticacion sigue" + 8 bytes de reto.
-            // Con menos de 9 bytes la tarjeta no arranco la autenticacion.
-            guard err1 == nil, resp1.count >= 9, resp1.first == 0xAF else {
+            self.record(name: "\(etiqueta) clave \(keyNo) paso 1"
+                        + (intento > 1 ? " (reintento \(intento))" : ""),
+                        tx: cmd1, rx: resp1, error: err1?.localizedDescription ?? "")
+
+            // Un reto son 9 bytes: estado 0xAF al principio + 8 bytes cifrados. Con menos
+            // de eso, la tarjeta no arranco la autenticacion.
+            let hayReto = err1 == nil && resp1.count >= 9 && resp1.first == 0xAF
+
+            // 0xCA = COMMAND_ABORTED. La tarjeta admite UNA autenticacion a la vez, asi
+            // que si quedo una a medias devuelve esto. NO es un fallo de autenticacion y
+            // NO gasta intento: se reintenta. Lo medimos en una tarjeta real.
+            if !hayReto, resp1.first == 0xCA, intento < 3 {
+                self.record(name: "\(etiqueta) clave \(keyNo): COMMAND_ABORTED",
+                            tx: Data(), rx: resp1,
+                            error: "habia una autenticacion a medias; no gasta intento, se reintenta")
+                self.authenticateLegacy(tag, ins: ins, keyNo: keyNo, key: key,
+                                        etiqueta: etiqueta, intento: intento + 1, done: done)
+                return
+            }
+
+            guard hayReto else {
                 self.record(name: "\(etiqueta) clave \(keyNo) NO aceptado", tx: Data(), rx: resp1,
                             error: "la tarjeta no arranca esta autenticacion; no gasta intento")
                 done(false, false)
                 return
             }
-            if soloSondear {
-                self.record(name: "\(etiqueta) clave \(keyNo) ACEPTADO (solo sondeo)",
-                            tx: Data(), rx: Data(),
-                            error: "la clave admite \(etiqueta); no se envia criptograma")
-                done(true, false)
-                return
-            }
+
             let encRndB = Data(resp1.dropFirst().prefix(8))
             guard let rndB = DesfireCrypto.desCBC(encRndB, key: clave, iv: Data(count: 8),
                                                   encrypt: false) else { done(true, false); return }
@@ -648,14 +659,15 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                     }
                 }
                 self.record(name: "\(etiqueta) clave \(keyNo) fallo", tx: Data(), rx: resp2,
-                            error: "el reto no cuadra: la clave \(keyNo) NO es la por defecto")
+                            error: "el reto no cuadra: la clave \(keyNo) NO es la por defecto"
+                                   + " (se ha gastado 1 de sus 3 intentos)")
                 done(true, false)
             }
         }
     }
 
-    /// Claves con version 00 en un chip que no es AES: primero se sondea que familia
-    /// acepta (gratis) y solo despues se compromete un intento con la que acepte.
+    /// Claves con version 00 en un chip que no es AES. Se intenta 2K3DES y, solo si la
+    /// tarjeta no arranca esa autenticacion (sin gastar intento), 3K3DES.
     private func probeLegacyKeys(_ tag: NFCMiFareTag, index: Int, lista: [UInt8],
                                  session: NFCTagReaderSession) {
         guard index < lista.count else {
@@ -664,35 +676,25 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
             return
         }
         let keyNo = lista[index]
-        let cero16 = Data(count: 16)
-        let cero24 = Data(count: 24)
-        setStatus("Clave \(keyNo): ¿acepta 2K3DES? (sondeo, sin criptograma)")
-        authenticateLegacy(tag, ins: 0x0A, keyNo: keyNo, key: cero16,
-                           etiqueta: "Authenticate 2K3DES", soloSondear: true) { aceptado2k, _ in
+        setStatus("Clave \(keyNo): intentando el valor por defecto con 2K3DES...")
+        authenticateLegacy(tag, ins: 0x0A, keyNo: keyNo, key: Data(count: 16),
+                           etiqueta: "Authenticate 2K3DES") { aceptado2k, exito2k in
             if aceptado2k {
-                self.setStatus("Clave \(keyNo): 2K3DES aceptado. Intentando el valor por defecto...")
-                self.authenticateLegacy(tag, ins: 0x0A, keyNo: keyNo, key: cero16,
-                                        etiqueta: "Authenticate 2K3DES", soloSondear: false) { _, exito in
-                    self.trasIntentoLegacy(tag, keyNo: keyNo, exito: exito, index: index,
-                                           lista: lista, session: session)
-                }
+                self.trasIntentoLegacy(tag, keyNo: keyNo, exito: exito2k, index: index,
+                                       lista: lista, session: session)
                 return
             }
-            self.setStatus("Clave \(keyNo): 2K3DES no. ¿Acepta 3K3DES?")
-            self.authenticateLegacy(tag, ins: 0x1A, keyNo: keyNo, key: cero24,
-                                    etiqueta: "AuthenticateISO 3K3DES", soloSondear: true) { aceptado3k, _ in
+            self.setStatus("Clave \(keyNo): 2K3DES no. Probando 3K3DES...")
+            self.authenticateLegacy(tag, ins: 0x1A, keyNo: keyNo, key: Data(count: 24),
+                                    etiqueta: "AuthenticateISO 3K3DES") { aceptado3k, exito3k in
                 guard aceptado3k else {
                     self.record(name: "Clave \(keyNo): sin familia legacy", tx: Data(), rx: Data(),
                                 error: "no acepta ni 0x0A ni 0x1A: no se ha gastado ningun intento")
                     self.probeLegacyKeys(tag, index: index + 1, lista: lista, session: session)
                     return
                 }
-                self.setStatus("Clave \(keyNo): 3K3DES aceptado. Intentando el valor por defecto...")
-                self.authenticateLegacy(tag, ins: 0x1A, keyNo: keyNo, key: cero24,
-                                        etiqueta: "AuthenticateISO 3K3DES", soloSondear: false) { _, exito in
-                    self.trasIntentoLegacy(tag, keyNo: keyNo, exito: exito, index: index,
-                                           lista: lista, session: session)
-                }
+                self.trasIntentoLegacy(tag, keyNo: keyNo, exito: exito3k, index: index,
+                                       lista: lista, session: session)
             }
         }
     }
