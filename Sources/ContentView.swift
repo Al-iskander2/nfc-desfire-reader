@@ -36,7 +36,7 @@ struct ContentView: View {
                 .disabled(reader.busy)
 
                 Button(action: { showAuthConfirm = true }) {
-                    Text("PROBAR CLAVE POR DEFECTO")
+                    Text("SONDEO DE CLAVES")
                         .fontWeight(.semibold)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
@@ -45,11 +45,11 @@ struct ContentView: View {
                 .foregroundColor(.white)
                 .cornerRadius(10)
                 .disabled(reader.busy)
-                .alert("¿Probar la clave por defecto?", isPresented: $showAuthConfirm) {
+                .alert("¿Sondear las claves?", isPresented: $showAuthConfirm) {
                     Button("Cancelar", role: .cancel) { }
-                    Button("Probar", role: .destructive) { reader.startDefaultKeyProbe() }
+                    Button("Sondear", role: .destructive) { reader.startDefaultKeyProbe() }
                 } message: {
-                    Text("Se prueba la clave 00…00 UNA sola vez por cada clave del chip (0, 3, 4 y 13).\n\nCada clave tolera 3 fallos antes de bloquearse, así que esto gasta 1 de esos 3 en cada una. Si las claves están diversificadas por UID, que es lo habitual en una tarjeta de transporte, fallará.\n\nNo se escribe, ni se borra, ni se formatea nada. Solo lectura.")
+                    Text("Fase 1, sin riesgo: GetKeySettings y GetKeyVersion. Solo preguntan al chip qué tipo de clave usa y en qué versión está cada una. No autentican, no gastan intentos.\n\nFase 2, solo si la fase 1 lo justifica: probar la clave 00…00 UNA vez por clave, y solo en las que parezcan de fábrica. Cada clave tolera 3 fallos, así que como mucho gasta 1 de 3.\n\nNunca se escribe, ni se borra, ni se formatea nada.")
                 }
 
                 Text(reader.status)
@@ -80,7 +80,7 @@ struct ContentView: View {
 
                 Spacer(minLength: 0)
 
-                Text("LEER TARJETA explora sin autenticar nada. PROBAR CLAVE POR DEFECTO intenta, una sola vez por clave, el valor por defecto. Ninguna de las dos escribe: GetVersion, GetApplicationIDs, SelectApplication, GetFileIDs, GetFileSettings, GetKeySettings, ReadData y Authenticate.")
+                Text("LEER TARJETA explora sin autenticar nada. SONDEO DE CLAVES primero pregunta (GetKeySettings, GetKeyVersion) y solo prueba la clave por defecto una vez por clave si la información lo justifica. Ninguna de las dos escribe.")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }

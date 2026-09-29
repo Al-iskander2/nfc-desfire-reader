@@ -453,10 +453,13 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
     private var probeUID = ""
     private var probeHistorical: String?
     private var probeApps: [String] = []
+    /// Versiones de clave leidas con GetKeyVersion, por numero de clave.
+    private var probeKeyVersions: [UInt8: String] = [:]
 
     private func runDefaultKeyProbe(_ tag: NFCMiFareTag, session: NFCTagReaderSession) {
         probeUID = tag.identifier.hex
         probeHistorical = tag.historicalBytes?.hex
+        probeKeyVersions = [:]
         setStatus("Leyendo el chip...")
 
         runFrames(tag, mode: .native, ins: 0x60, data: Data(), name: "GetVersion") { _, _, _ in
@@ -499,15 +502,68 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                 self.finalizeProbe(session)
                 return
             }
-            guard esAES else {
-                self.setStatus("El chip dice que sus claves NO son AES. No implementado: nada se prueba a ciegas.")
-                self.record(name: "Sondeo abortado", tx: Data(), rx: Data(),
-                            error: "el chip declara claves no-AES; no se intenta nada")
-                self.finalizeProbe(session)
-                return
+
+            // Reconocimiento ANTES de decidir: GetKeyVersion no autentica nada, no
+            // consume intentos y puede ahorrarnos gastarlos en balde.
+            self.readKeyVersions(tag, index: 0) {
+                self.decideAfterRecon(tag, esAES: esAES, session: session)
             }
-            self.probeKeys(tag, index: 0, session: session)
         }
+    }
+
+    /// GetKeyVersion (0x64) para las claves candidatas. Reconocimiento puro: no
+    /// autentica, no gasta intentos. Un version 0x00 suele ser la de fabrica, es decir,
+    /// la clave SIN personalizar; cualquier otro valor indica que se cambio.
+    private func readKeyVersions(_ tag: NFCMiFareTag, index: Int, done: @escaping () -> Void) {
+        let lista = DesfireReader.defaultKeyCandidates
+        guard index < lista.count else { done(); return }
+        let keyNo = lista[index]
+        let cmd = Data([0x64, keyNo])
+        tag.sendMiFareCommand(commandPacket: cmd) { resp, err in
+            let (payload, status) = self.splitStatus(resp, mode: .native)
+            let version = payload.first.map { String(format: "%02X", $0) } ?? "?"
+            let estado = String(format: "%02X", status)
+            self.probeKeyVersions[keyNo] = "(version=\(version), estado=\(estado))"
+            self.record(name: "GetKeyVersion clave \(keyNo) (version=\(version), estado=\(estado))",
+                        tx: cmd, rx: resp, error: err?.localizedDescription ?? "")
+            self.readKeyVersions(tag, index: index + 1, done: done)
+        }
+    }
+
+    /// Decide con la informacion en la mano. Nada de intentos a ciegas: si el chip
+    /// declara claves no-AES, el camino DES/3DES no esta implementado y se para aqui.
+    /// Y si ninguna clave tiene version 0x00, ninguna es la de fabrica: tampoco se
+    /// gasta un intento en algo que no puede funcionar.
+    private func decideAfterRecon(_ tag: NFCMiFareTag, esAES: Bool, session: NFCTagReaderSession) {
+        let porDefecto = DesfireReader.defaultKeyCandidates.filter {
+            probeKeyVersions[$0]?.contains("version=00") == true
+        }
+        let resumen = DesfireReader.defaultKeyCandidates
+            .map { "\($0):\(probeKeyVersions[$0] ?? "sin respuesta")" }
+            .joined(separator: " ")
+
+        guard esAES else {
+            let motivo = porDefecto.isEmpty
+                ? "claves no-AES y ninguna con version 00: no hay nada que probar"
+                : "claves no-AES, pero las claves \(porDefecto) tienen version 00 (posibles de fabrica)"
+            setStatus(porDefecto.isEmpty
+                      ? "Nada que probar: el chip no usa AES y ninguna clave parece de fabrica."
+                      : "Atencion: el chip no usa AES, pero hay claves con version 00. Hace falta implementar el camino DES/3DES.")
+            record(name: "Reconocimiento terminado [\(resumen)]", tx: Data(), rx: Data(), error: motivo)
+            finalizeProbe(session)
+            return
+        }
+
+        if porDefecto.isEmpty {
+            setStatus("El chip usa AES pero ninguna clave tiene version 00: ya estan personalizadas.")
+            record(name: "Reconocimiento terminado [\(resumen)]", tx: Data(), rx: Data(),
+                   error: "ninguna clave con version 00: no se gasta ningun intento")
+            finalizeProbe(session)
+            return
+        }
+        record(name: "Reconocimiento terminado [\(resumen)]", tx: Data(), rx: Data(),
+               error: "claves \(porDefecto) con version 00: procede intentar el valor por defecto")
+        probeKeys(tag, index: 0, session: session)
     }
 
     private func probeKeys(_ tag: NFCMiFareTag, index: Int, session: NFCTagReaderSession) {
