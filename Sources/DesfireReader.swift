@@ -542,32 +542,29 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
             .map { "\($0):\(probeKeyVersions[$0] ?? "sin respuesta")" }
             .joined(separator: " ")
 
-        guard esAES else {
-            let motivo = porDefecto.isEmpty
-                ? "claves no-AES y ninguna con version 00: no hay nada que probar"
-                : "claves no-AES, pero las claves \(porDefecto) tienen version 00 (posibles de fabrica)"
-            setStatus(porDefecto.isEmpty
-                      ? "Nada que probar: el chip no usa AES y ninguna clave parece de fabrica."
-                      : "Atencion: el chip no usa AES, pero hay claves con version 00. Hace falta implementar el camino DES/3DES.")
-            record(name: "Reconocimiento terminado [\(resumen)]", tx: Data(), rx: Data(), error: motivo)
+        record(name: "Reconocimiento terminado [\(resumen)]", tx: Data(), rx: Data(),
+               error: porDefecto.isEmpty
+                   ? "ninguna clave con version 00: no se gasta ningun intento"
+                   : "claves \(porDefecto) con version 00: procede intentar el valor por defecto")
+
+        guard !porDefecto.isEmpty else {
+            setStatus("Ninguna clave tiene version 00: no se gasta ningun intento.")
             finalizeProbe(session)
             return
         }
 
-        if porDefecto.isEmpty {
-            setStatus("El chip usa AES pero ninguna clave tiene version 00: ya estan personalizadas.")
-            record(name: "Reconocimiento terminado [\(resumen)]", tx: Data(), rx: Data(),
-                   error: "ninguna clave con version 00: no se gasta ningun intento")
-            finalizeProbe(session)
+        if esAES {
+            setStatus("Claves AES y \(porDefecto) con version 00: probando el valor por defecto...")
+            probeKeysAES(tag, index: 0, lista: porDefecto, session: session)
             return
         }
-        record(name: "Reconocimiento terminado [\(resumen)]", tx: Data(), rx: Data(),
-               error: "claves \(porDefecto) con version 00: procede intentar el valor por defecto")
-        probeKeys(tag, index: 0, session: session)
+
+        setStatus("Claves DES/3DES y \(porDefecto) con version 00: sondeando el algoritmo...")
+        probeLegacyKeys(tag, index: 0, lista: porDefecto, session: session)
     }
 
-    private func probeKeys(_ tag: NFCMiFareTag, index: Int, session: NFCTagReaderSession) {
-        let lista = DesfireReader.defaultKeyCandidates
+    private func probeKeysAES(_ tag: NFCMiFareTag, index: Int, lista: [UInt8],
+                              session: NFCTagReaderSession) {
         guard index < lista.count else {
             self.setStatus("Sondeo terminado: ninguna clave por defecto. La tarjeta queda intacta.")
             self.record(name: "Sondeo terminado", tx: Data(), rx: Data(),
@@ -581,11 +578,134 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
             if ok {
                 self.setStatus("CLAVE \(keyNo) ES LA POR DEFECTO. Leyendo los archivos enteros...")
                 self.readAllFiles(tag, index: 0) {
-                    self.probeKeys(tag, index: index + 1, session: session)
+                    self.probeKeysAES(tag, index: index + 1, lista: lista, session: session)
                 }
             } else {
-                self.probeKeys(tag, index: index + 1, session: session)
+                self.probeKeysAES(tag, index: index + 1, lista: lista, session: session)
             }
+        }
+    }
+
+    // MARK: Camino legacy (DES / 2K3DES / 3K3DES)
+
+    /// Autenticacion legacy: Authenticate (0x0A) para DES/2K3DES o AuthenticateISO
+    /// (0x1A) para 3K3DES. Bloques de 8 bytes, misma estructura que AES pero con el IV
+    /// del ULTIMO BLOQUE DE 8 del cifrado que enviamos.
+    ///
+    /// Con `soloSondear = true` se ejecuta SOLO el primer intercambio: se manda el
+    /// comando y se mira si la tarjeta responde con un reto. Eso revela que familia
+    /// criptografica acepta esa clave SIN enviar ningun criptograma, o sea sin arriesgar
+    /// un fallo de autenticacion. Es la parte gratis: si no la acepta, se prueba la otra
+    /// sin coste.
+    private func authenticateLegacy(_ tag: NFCMiFareTag, ins: UInt8, keyNo: UInt8,
+                                    key: Data, etiqueta: String, soloSondear: Bool,
+                                    done: @escaping (Bool, Bool) -> Void) {
+        let cmd1 = Data([ins, keyNo])
+        let clave = DesfireCrypto.sinBitsDeVersion(key)   // el bit 0 de cada byte es la version
+        tag.sendMiFareCommand(commandPacket: cmd1) { resp1, err1 in
+            self.record(name: "\(etiqueta) clave \(keyNo) paso 1", tx: cmd1, rx: resp1,
+                        error: err1?.localizedDescription ?? "")
+            // Estado al principio: 0xAF = "la autenticacion sigue" + 8 bytes de reto.
+            // Con menos de 9 bytes la tarjeta no arranco la autenticacion.
+            guard err1 == nil, resp1.count >= 9, resp1.first == 0xAF else {
+                self.record(name: "\(etiqueta) clave \(keyNo) NO aceptado", tx: Data(), rx: resp1,
+                            error: "la tarjeta no arranca esta autenticacion; no gasta intento")
+                done(false, false)
+                return
+            }
+            if soloSondear {
+                self.record(name: "\(etiqueta) clave \(keyNo) ACEPTADO (solo sondeo)",
+                            tx: Data(), rx: Data(),
+                            error: "la clave admite \(etiqueta); no se envia criptograma")
+                done(true, false)
+                return
+            }
+            let encRndB = Data(resp1.dropFirst().prefix(8))
+            guard let rndB = DesfireCrypto.desCBC(encRndB, key: clave, iv: Data(count: 8),
+                                                  encrypt: false) else { done(true, false); return }
+            let rndA = DesfireCrypto.randomBytes(8)
+            let bloque = rndA + DesfireCrypto.rotateLeft(rndB)
+            guard let encBloque = DesfireCrypto.desCBC(bloque, key: clave, iv: encRndB,
+                                                       encrypt: true) else { done(true, false); return }
+            // El IV del paso 3 es el ultimo bloque de 8 del cifrado enviado.
+            let ivPaso3 = Data(encBloque.suffix(8))
+            let cmd2 = Data([0xAF]) + encBloque
+            tag.sendMiFareCommand(commandPacket: cmd2) { resp2, err2 in
+                self.record(name: "\(etiqueta) clave \(keyNo) paso 2", tx: cmd2, rx: resp2,
+                            error: err2?.localizedDescription ?? "")
+                guard err2 == nil, resp2.count >= 9 else { done(true, false); return }
+                let candidatos = [Data(resp2.dropFirst().prefix(8)),
+                                  Data(resp2.dropLast().suffix(8))]
+                let esperado = DesfireCrypto.rotateLeft(rndA)
+                for cand in candidatos {
+                    if let claro = DesfireCrypto.desCBC(cand, key: clave, iv: ivPaso3, encrypt: false),
+                       claro == esperado {
+                        _ = DesfireCrypto.sessionKeyLegacy(rndA: rndA, rndB: rndB, keyLength: clave.count)
+                        self.record(name: "\(etiqueta) clave \(keyNo) AUTENTICADO", tx: Data(), rx: Data(),
+                                    error: "la clave \(keyNo) tiene el valor por defecto")
+                        done(true, true)
+                        return
+                    }
+                }
+                self.record(name: "\(etiqueta) clave \(keyNo) fallo", tx: Data(), rx: resp2,
+                            error: "el reto no cuadra: la clave \(keyNo) NO es la por defecto")
+                done(true, false)
+            }
+        }
+    }
+
+    /// Claves con version 00 en un chip que no es AES: primero se sondea que familia
+    /// acepta (gratis) y solo despues se compromete un intento con la que acepte.
+    private func probeLegacyKeys(_ tag: NFCMiFareTag, index: Int, lista: [UInt8],
+                                 session: NFCTagReaderSession) {
+        guard index < lista.count else {
+            self.setStatus("Sondeo terminado. La tarjeta queda intacta.")
+            self.finalizeProbe(session)
+            return
+        }
+        let keyNo = lista[index]
+        let cero16 = Data(count: 16)
+        let cero24 = Data(count: 24)
+        setStatus("Clave \(keyNo): ¿acepta 2K3DES? (sondeo, sin criptograma)")
+        authenticateLegacy(tag, ins: 0x0A, keyNo: keyNo, key: cero16,
+                           etiqueta: "Authenticate 2K3DES", soloSondear: true) { aceptado2k, _ in
+            if aceptado2k {
+                self.setStatus("Clave \(keyNo): 2K3DES aceptado. Intentando el valor por defecto...")
+                self.authenticateLegacy(tag, ins: 0x0A, keyNo: keyNo, key: cero16,
+                                        etiqueta: "Authenticate 2K3DES", soloSondear: false) { _, exito in
+                    self.trasIntentoLegacy(tag, keyNo: keyNo, exito: exito, index: index,
+                                           lista: lista, session: session)
+                }
+                return
+            }
+            self.setStatus("Clave \(keyNo): 2K3DES no. ¿Acepta 3K3DES?")
+            self.authenticateLegacy(tag, ins: 0x1A, keyNo: keyNo, key: cero24,
+                                    etiqueta: "AuthenticateISO 3K3DES", soloSondear: true) { aceptado3k, _ in
+                guard aceptado3k else {
+                    self.record(name: "Clave \(keyNo): sin familia legacy", tx: Data(), rx: Data(),
+                                error: "no acepta ni 0x0A ni 0x1A: no se ha gastado ningun intento")
+                    self.probeLegacyKeys(tag, index: index + 1, lista: lista, session: session)
+                    return
+                }
+                self.setStatus("Clave \(keyNo): 3K3DES aceptado. Intentando el valor por defecto...")
+                self.authenticateLegacy(tag, ins: 0x1A, keyNo: keyNo, key: cero24,
+                                        etiqueta: "AuthenticateISO 3K3DES", soloSondear: false) { _, exito in
+                    self.trasIntentoLegacy(tag, keyNo: keyNo, exito: exito, index: index,
+                                           lista: lista, session: session)
+                }
+            }
+        }
+    }
+
+    private func trasIntentoLegacy(_ tag: NFCMiFareTag, keyNo: UInt8, exito: Bool, index: Int,
+                                   lista: [UInt8], session: NFCTagReaderSession) {
+        if exito {
+            setStatus("CLAVE \(keyNo) ES LA POR DEFECTO. Leyendo los archivos enteros...")
+            readAllFiles(tag, index: 0) {
+                self.probeLegacyKeys(tag, index: index + 1, lista: lista, session: session)
+            }
+        } else {
+            probeLegacyKeys(tag, index: index + 1, lista: lista, session: session)
         }
     }
 
@@ -602,10 +722,11 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
         tag.sendMiFareCommand(commandPacket: cmd1) { resp1, err1 in
             self.record(name: label + " paso 1", tx: cmd1, rx: resp1,
                         error: err1?.localizedDescription ?? "")
+            let status1 = resp1.first ?? 0xFF
             // El estado va al principio en este stack (establecido con datos reales).
-            // Si aqui no hay un 0x00, se aborta SIN llegar a intentar la clave, que es
-            // el modo de fallo seguro.
-            guard err1 == nil, resp1.count >= 17, resp1.first == 0x00 else {
+            // 0xAF = "la autenticacion sigue"; se tolera tambien 0x00. Si no hay ni eso,
+            // se aborta SIN llegar a intentar la clave: modo de fallo seguro.
+            guard err1 == nil, resp1.count >= 17, status1 == 0xAF || status1 == 0x00 else {
                 self.record(name: label + " abortado", tx: Data(), rx: resp1,
                             error: "respuesta inesperada; no se ha intentado ninguna clave")
                 done(false, nil)
@@ -640,7 +761,7 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                        claro == esperado {
                         self.record(name: label + " AUTENTICADO", tx: Data(), rx: Data(),
                                     error: "la clave \(keyNo) tiene el valor por defecto")
-                        done(true, DesfireCrypto.sessionKey(rndA: rndA, rndB: rndB))
+                        done(true, DesfireCrypto.sessionKeyAES(rndA: rndA, rndB: rndB))
                         return
                     }
                 }
