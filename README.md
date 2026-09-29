@@ -50,10 +50,26 @@ verifica en el log que el entitlement NFC quedo embebido.
 
 ## Instalar en el iPhone 7
 
-1. En el iPhone 7, abre el `.ipa` (desde Archivos, Safari, o pasalo por AirDrop) y
-   elige **Abrir en TrollStore**. TrollStore lo instala de forma permanente, sin
-   caducidad de 7 dias.
-2. Al abrirlo por primera vez, iOS pedira permiso de NFC. Acepta.
+### Metodo 1: por URL, sin cables (TrollStore lo instala solo)
+
+TrollStore registra el esquema de URL `apple-magnifier://`. Sirve el .ipa por HTTP en
+el Mac:
+
+    cd dist
+    /opt/anaconda3/bin/python3.12 -u -m http.server 8080 --bind 0.0.0.0
+
+Y en Safari del iPhone 7 abre:
+
+    apple-magnifier://install?url=http://IP_DEL_MAC:8080/NFCDesfireReader.ipa
+
+TrollStore descarga el .ipa y lo instala. Sin cables, sin cuenta, sin Archivos.
+
+### Metodo 2: AirDrop
+
+Pasa el `.ipa` por AirDrop del Mac al iPhone 7. En el telefono, tocarlo y elegir
+**TrollStore** en el menu de compartir.
+
+Al abrir la app por primera vez, iOS pedira permiso de NFC. Acepta.
 
 ## Usar
 
