@@ -11,9 +11,22 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-15 trae Xcode 16.x. Necesario: xcodegen 2.46 genera proyectos en formato
+    # 77 (objectVersion 77), que Xcode 15.4 (macos-14) no puede abrir.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Seleccionar el Xcode mas nuevo disponible
+        run: |
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          NEWEST="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -n "$NEWEST" ]; then
+            echo "Usando: $NEWEST"
+            sudo xcode-select -s "$NEWEST"
+          fi
+          xcode-select -p
+          xcodebuild -version
 
       - name: Instalar xcodegen y ldid
         run: |
@@ -21,13 +34,15 @@ jobs:
           brew install ldid-procursus || brew install ldid
           which ldid
           xcodegen --version
-          xcodebuild -version
 
       - name: Generar el proyecto Xcode
-        run: xcodegen generate
+        run: |
+          xcodegen generate
+          grep -m1 objectVersion NFCDesfireReader.xcodeproj/project.pbxproj
 
       - name: Compilar (sin firma)
         run: |
+          set -o pipefail   # sin esto, el pipe a tail se come el error de xcodebuild
           xcodebuild \
             -project NFCDesfireReader.xcodeproj \
             -scheme NFCDesfireReader \
@@ -38,7 +53,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build | tail -40
+            build 2>&1 | tail -60
 
       - name: Verificar el binario
         run: |
