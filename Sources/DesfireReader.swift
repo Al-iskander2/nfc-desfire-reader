@@ -433,8 +433,9 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                             UInt8((offset >> 8) & 0xFF),
                             UInt8(offset & 0xFF),
                             len, 0x00, 0x00])
-        run(tag, ins: 0xBD, data: request, expect: Int(len),
-            name: "ReadData \(aidHex) fid \(fidHex) off \(offset) len \(len)") { payload, status in
+        run(tag, ins: 0xBD, data: request,
+            name: "ReadData \(aidHex) fid \(fidHex) off \(offset) len \(len)",
+            expect: Int(len)) { payload, status in
             if status != 0x00 || payload.isEmpty {
                 self.record(name: "ReadData \(aidHex) fid \(fidHex) [fin]",
                             tx: Data(), rx: Data(),
