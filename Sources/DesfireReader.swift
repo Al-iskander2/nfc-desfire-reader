@@ -78,7 +78,10 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
     private let maxFrames = 10
     private let maxApps = 8
     private let maxFiles = 12
-    private let readLength: UInt8 = 16
+    /// Tamano de cada trozo de ReadData y tope total por archivo. Acotado a proposito:
+    /// solo queremos ver el principio de cada archivo, no volcar tarjetas enteras.
+    private let readChunk = 32
+    private let maxReadBytes = 64
 
     /// Estados DESFire validos. Se usan para DEDUCIR donde va el byte de estado, porque
     /// CoreNFC no es consistente: en la primera respuesta de GetVersion el 0xAF vino
@@ -168,8 +171,12 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
 
         if firstIsStatus && !lastIsStatus { return (Data(raw.dropFirst()), first) }
         if lastIsStatus && !firstIsStatus { return (Data(raw.dropLast()), last) }
-        // Ambiguo (los dos parecen estado): 0xAF solo tiene sentido al principio.
-        if first == 0xAF { return (Data(raw.dropFirst()), first) }
+        // Ambiguo: los dos extremos parecen estado (tipico en GetFileSettings y ReadData,
+        // donde el primer byte de datos es 0x00). Medido en hardware: en este stack el
+        // estado va AL PRINCIPIO. Leerlo al reves da tamanos de archivo imposibles
+        // (8419 bytes en una tarjeta de 4096); al derecho, la suma de los 11 archivos
+        // son 3584 bytes <= 4096. Solo una lectura cuadra con la capacidad del chip.
+        if first == 0x00 || first == 0xAF { return (Data(raw.dropFirst()), first) }
         return (Data(raw.dropLast()), last)
     }
 
@@ -339,13 +346,51 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
         guard index < fids.count, index < maxFiles else { done(); return }
         let fid = fids[index]
         let fidHex = String(format: "%02X", fid)
-        run(tag, ins: 0xF5, data: Data([fid]), name: "GetFileSettings \(aidHex) fid \(fidHex)") { _, _ in
-            // ReadData: fid(1) + offset(3) + longitud(3)
-            let request = Data([fid, 0x00, 0x00, 0x00, self.readLength, 0x00, 0x00])
-            self.run(tag, ins: 0xBD, data: request,
-                     name: "ReadData \(aidHex) fid \(fidHex) off 0 len \(self.readLength)") { _, _ in
+        run(tag, ins: 0xF5, data: Data([fid]),
+            name: "GetFileSettings \(aidHex) fid \(fidHex)") { settings, _ in
+            // GetFileSettings: tipo(1) + comunicacion(1) + access rights(2) +
+            // tamano(3, LSB primero). Con el tamano sabemos cuanto leer.
+            let bytes = [UInt8](settings)
+            var size = 0
+            if bytes.count >= 7 {
+                size = Int(bytes[4]) | (Int(bytes[5]) << 8) | (Int(bytes[6]) << 16)
+            }
+            let limit = min(size, self.maxReadBytes)
+            self.readFile(tag, aidHex: aidHex, fid: fid, fidHex: fidHex,
+                          offset: 0, limit: limit) {
                 self.exploreFiles(tag, aidHex: aidHex, fids: fids, index: index + 1, done: done)
             }
+        }
+    }
+
+    /// Lee el archivo por trozos hasta `limit` bytes. Se detiene en el primer error:
+    /// si la clave del archivo no esta, el primer trozo ya devuelve AUTHENTICATION_ERROR.
+    private func readFile(_ tag: NFCMiFareTag,
+                          aidHex: String,
+                          fid: UInt8,
+                          fidHex: String,
+                          offset: Int,
+                          limit: Int,
+                          done: @escaping () -> Void) {
+        guard offset < limit else { done(); return }
+        let len = UInt8(min(Int(readChunk), limit - offset))
+        // ReadData: fid(1) + offset(3) + longitud(3), todo LSB primero.
+        let request = Data([fid,
+                            UInt8((offset >> 16) & 0xFF),
+                            UInt8((offset >> 8) & 0xFF),
+                            UInt8(offset & 0xFF),
+                            len, 0x00, 0x00])
+        run(tag, ins: 0xBD, data: request,
+            name: "ReadData \(aidHex) fid \(fidHex) off \(offset) len \(len)") { payload, status in
+            if status != 0x00 || payload.isEmpty {
+                self.record(name: "ReadData \(aidHex) fid \(fidHex) [fin]",
+                            tx: Data(), rx: Data(),
+                            error: "se detiene aqui: \(statusName(status))")
+                done()
+                return
+            }
+            self.readFile(tag, aidHex: aidHex, fid: fid, fidHex: fidHex,
+                          offset: offset + Int(len), limit: limit, done: done)
         }
     }
 
