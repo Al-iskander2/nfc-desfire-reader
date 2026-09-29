@@ -66,9 +66,22 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
     @Published var status = "Pulsa LEER TARJETA y acerca la tarjeta."
     @Published var output = ""
     @Published var busy = false
-    @Published var serverURL: String =
-        UserDefaults.standard.string(forKey: "serverURL") ?? "http://192.168.1.50:8000/scan" {
+    /// URL del Mac del laboratorio. Viene puesta por defecto, se puede editar en la
+    /// pantalla y se recuerda entre lanzamientos.
+    static let defaultServerURL = "http://172.20.10.6:8000/scan"
+    /// Placeholder viejo: si esta guardado en UserDefaults, se ignora.
+    private static let staleServerURL = "192.168.1.50"
+
+    @Published var serverURL: String = DesfireReader.initialServerURL() {
         didSet { UserDefaults.standard.set(serverURL, forKey: "serverURL") }
+    }
+
+    static func initialServerURL() -> String {
+        if let stored = UserDefaults.standard.string(forKey: "serverURL"),
+           !stored.isEmpty, !stored.contains(staleServerURL) {
+            return stored
+        }
+        return defaultServerURL
     }
 
     private var session: NFCTagReaderSession?
@@ -406,11 +419,19 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
             self.busy = false
         }
 
-        let trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmed), let scheme = url.scheme,
-              scheme == "http" || scheme == "https" else {
-            setStatus("Leido. URL del Mac invalida, no se envio. El JSON queda en pantalla.")
+        send(body, attempt: 1) { resultado in
+            self.setStatus(resultado)
             session.invalidate()
+        }
+    }
+
+    /// Envia el JSON al Mac. Reintenta una vez si falla, y deja en pantalla la respuesta
+    /// del servidor (que incluye el nombre del archivo guardado) para que se sepa si
+    /// llego de verdad.
+    private func send(_ body: Data?, attempt: Int, done: @escaping (String) -> Void) {
+        guard let url = URL(string: serverURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = url.scheme, scheme == "http" || scheme == "https" else {
+            done("Leido. URL del Mac invalida, no se envio. El JSON queda en pantalla.")
             return
         }
 
@@ -420,15 +441,28 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
         request.httpBody = body
         request.timeoutInterval = 8
 
-        URLSession.shared.dataTask(with: request) { _, response, error in
+        URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
-                self.setStatus("Leido, pero no se pudo enviar: \(error.localizedDescription). JSON en pantalla.")
-            } else if let http = response as? HTTPURLResponse {
-                self.setStatus("Enviado al Mac. HTTP \(http.statusCode).")
-            } else {
-                self.setStatus("Leido. Respuesta desconocida del servidor.")
+                if attempt < 2 {
+                    self.setStatus("El Mac no respondio, reintentando...")
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+                        self.send(body, attempt: attempt + 1, done: done)
+                    }
+                    return
+                }
+                done("Leido, pero NO se pudo enviar: \(error.localizedDescription). JSON en pantalla.")
+                return
             }
-            session.invalidate()
+            guard let http = response as? HTTPURLResponse else {
+                done("Leido. Respuesta desconocida del servidor.")
+                return
+            }
+            let texto = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            if (200..<300).contains(http.statusCode) {
+                done("ENVIADO AL MAC (HTTP \(http.statusCode))  \(texto)")
+            } else {
+                done("El Mac respondio HTTP \(http.statusCode). JSON en pantalla.")
+            }
         }.resume()
     }
 }

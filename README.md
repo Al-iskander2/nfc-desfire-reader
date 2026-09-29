@@ -94,10 +94,17 @@ Al abrir la app por primera vez, iOS pedira permiso de NFC. Acepta.
        /opt/anaconda3/bin/python3.12 -u -m uvicorn server:app --host 0.0.0.0 --port 8000
 
 2. Mira la IP del Mac: `ipconfig getifaddr en0`
-3. En la app, escribe `http://ESA_IP:8000/scan` (se guarda entre lanzamientos).
+
+3. La app trae `http://172.20.10.6:8000/scan` puesto por defecto. Si la IP del Mac
+   cambia, edita el campo en pantalla: se guarda entre lanzamientos. Si un valor
+   guardado apunta al placeholder viejo `192.168.1.50`, se ignora automaticamente.
+
 4. Pulsa **LEER TARJETA** y acerca la tarjeta a la parte de arriba del telefono.
-5. El JSON aparece en pantalla **y** aterriza en `mac/nfc_scans/`. Si el envio falla,
-   el JSON queda en pantalla igualmente: nada se pierde.
+
+5. El JSON aparece en pantalla **y** se envia solo al Mac, que lo guarda en
+   `mac/nfc_scans/`. La linea de estado confirma con `ENVIADO AL MAC (HTTP 200)` mas
+   el nombre del archivo. Si falla, reintenta una vez, y si tampoco, el JSON queda en
+   pantalla: nada se pierde.
 
 ## Estructura
 
