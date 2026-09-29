@@ -31,12 +31,27 @@ de la app, es la tarjeta negandose.
 
 Core NFC expone una DESFire como `NFCMiFareTag`, y hay dos formas de hablarle:
 
-- **native** — `sendMiFareCommand([0x60])`: comando DESFire crudo.
+- **native** — `sendMiFareCommand([0x60])`: comando DESFire crudo. **Es el que funciona**,
+  comprobado en hardware real el 29/09/2026.
 - **wrapped** — `sendMiFareISO7816Command(90 60 00 00 00)`: la misma orden envuelta en un
-  APDU ISO 7816 con CLA 0x90 (la tecnica de libfreefare).
+  APDU ISO 7816 con CLA 0x90 (la tecnica de libfreefare). En CoreNFC esta ruta devuelve
+  `Tag response error`, asi que queda solo como plan B.
 
-La app **prueba los dos** al empezar y usa el que contesta con status `0x00` u `0xAF`.
-Cual funciono te lo dice la pantalla, y ambos intentos quedan en el JSON.
+### El byte de estado viene AL PRINCIPIO
+
+Esto costo una iteracion entera y no esta documentado. La primera respuesta de GetVersion
+en hardware real fue:
+
+    AF 04 01 01 01 00 18 05
+
+con `0xAF` (ADDITIONAL_FRAME) **al principio** y los 7 bytes utiles detras, al contrario de
+lo que dice la especificacion DESFire (donde el estado va al final). Interpretarlo al reves
+corta el bucle de frames y deja la tarjeta a medias: el comando siguiente devuelve
+`COMMAND_ABORTED` (0xCA), que fue exactamente lo que paso.
+
+Por eso el codigo deduce el extremo por respuesta (`splitStatus`): si el primer byte es un
+estado DESFire valido y el ultimo no, va al principio; y al reves. El mismo criterio esta
+replicado en `mac/desfire_decode.py` para poder reinterpretar capturas viejas.
 
 ## Compilar (sin instalar Xcode)
 

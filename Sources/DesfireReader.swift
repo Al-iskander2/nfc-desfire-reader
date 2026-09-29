@@ -21,11 +21,9 @@ struct NFCScan: Codable {
 
 // MARK: - Modo de comandos
 
-/// Core NFC expone una DESFire como NFCMiFareTag. Hay dos formas de hablarle y no
-/// sabemos a priori cual acepta el telefono, asi que se prueban las dos:
-///   - native:  sendMiFareCommand([0x60])            comando DESFire crudo
-///   - wrapped: sendMiFareISO7816Command(90 60 00 00 00)  envoltura CLA 0x90
-/// La que conteste con status 0x00 o 0xAF (frame adicional) es la buena.
+/// Core NFC expone una DESFire como NFCMiFareTag. Se prueban los dos caminos:
+///   - native:  sendMiFareCommand([0x60])                 <- es el que funciona
+///   - wrapped: sendMiFareISO7816Command(90 60 00 00 00)  <- falla con "Tag response error"
 enum CommandMode: String {
     case native
     case wrapped
@@ -58,16 +56,11 @@ private func statusName(_ status: UInt8) -> String {
     desfireStatusNames[status] ?? String(format: "0x%02X", status)
 }
 
-// MARK: - Lector
-
 /// Lector DESFire de SOLO LECTURA.
 ///
-/// Solo ejecuta comandos de descubrimiento y lectura:
-///   GetVersion (0x60), GetApplicationIDs (0x6A), SelectApplication (0x5A),
-///   GetFileIDs (0x6F), GetFileSettings (0xF5), ReadData (0xBD).
-///
-/// NO autentica, NO cambia claves, NO escribe, NO formatea. Todo acotado:
-/// maximo 8 aplicaciones, 12 archivos por aplicacion, 16 bytes por lectura.
+/// Comandos: GetVersion (0x60), GetApplicationIDs (0x6A), SelectApplication (0x5A),
+/// GetFileIDs (0x6F), GetFileSettings (0xF5), ReadData (0xBD).
+/// NO autentica, NO cambia claves, NO escribe, NO formatea.
 final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelegate {
 
     @Published var status = "Pulsa LEER TARJETA y acerca la tarjeta."
@@ -82,11 +75,18 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
     private var transactions: [NFCTransaction] = []
     private var mode: CommandMode = .unknown
 
-    // Limites duros de exploracion.
-    private let maxFrames = 8
+    private let maxFrames = 10
     private let maxApps = 8
     private let maxFiles = 12
     private let readLength: UInt8 = 16
+
+    /// Estados DESFire validos. Se usan para DEDUCIR donde va el byte de estado, porque
+    /// CoreNFC no es consistente: en la primera respuesta de GetVersion el 0xAF vino
+    /// AL PRINCIPIO (AF 04 01 01 01 00 18 05), no al final.
+    private static let knownStatuses: Set<UInt8> = [
+        0x00, 0x0C, 0x0E, 0x1C, 0x1E, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2,
+        0xAE, 0xAF, 0xBE, 0xCA, 0xF0, 0xF1,
+    ]
 
     private func setStatus(_ text: String) {
         DispatchQueue.main.async { self.status = text }
@@ -122,7 +122,6 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
     func tagReaderSession(_ session: NFCTagReaderSession, didInvalidateWithError error: Error) {
         DispatchQueue.main.async { self.busy = false }
         let ns = error as NSError
-        // 200 = user canceled, 204 = session timeout: no son fallos reales.
         if ns.code == 200 || ns.code == 204 {
             setStatus("Sesion cerrada. Vuelve a pulsar LEER TARJETA.")
         } else {
@@ -150,20 +149,40 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
         }
     }
 
+    // MARK: Separacion del byte de estado
+
+    /// Devuelve (payload, status) sin importar en que extremo venga el estado.
+    private func splitStatus(_ raw: Data, mode explicitMode: CommandMode) -> (Data, UInt8) {
+        if raw.isEmpty { return (Data(), 0xFF) }
+        if raw.count == 1 { return (Data(), raw.first!) }
+
+        // En modo wrapped el APDU siempre devuelve SW1 SW2 al final (ya recortado aparte).
+        guard explicitMode != .wrapped else {
+            return (Data(raw.dropLast()), raw.last!)
+        }
+
+        let first = raw.first!
+        let last = raw.last!
+        let firstIsStatus = DesfireReader.knownStatuses.contains(first)
+        let lastIsStatus = DesfireReader.knownStatuses.contains(last)
+
+        if firstIsStatus && !lastIsStatus { return (Data(raw.dropFirst()), first) }
+        if lastIsStatus && !firstIsStatus { return (Data(raw.dropLast()), last) }
+        // Ambiguo (los dos parecen estado): 0xAF solo tiene sentido al principio.
+        if first == 0xAF { return (Data(raw.dropFirst()), first) }
+        return (Data(raw.dropLast()), last)
+    }
+
     // MARK: Comandos de bajo nivel
 
-    /// Ejecuta un comando en un modo CONCRETO y devuelve (payload, status).
-    /// El payload NO incluye el byte de estado en ningun modo.
-    private func execute(_ tag: NFCMiFareTag,
-                         mode explicitMode: CommandMode,
-                         ins: UInt8,
-                         data: Data,
-                         name: String,
-                         done: @escaping (Data, UInt8, Error?) -> Void) {
+    /// Un unico intercambio en un modo CONCRETO. Devuelve (payload, status).
+    private func exchange(_ tag: NFCMiFareTag,
+                          mode explicitMode: CommandMode,
+                          ins: UInt8,
+                          data: Data,
+                          name: String,
+                          done: @escaping (Data, UInt8) -> Void) {
         if explicitMode == .wrapped {
-            // Este inicializador NO lanza ni devuelve opcional (verificado en la doc
-            // de Apple: init(instructionClass:instructionCode:p1Parameter:p2Parameter:
-            // data:expectedResponseLength:)).
             let apdu = NFCISO7816APDU(instructionClass: 0x90,
                                       instructionCode: ins,
                                       p1Parameter: 0x00,
@@ -175,95 +194,54 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                 var raw = response
                 raw.append(sw1)
                 raw.append(sw2)
-                self.record(name: name + " [wrapped]",
-                            tx: tx,
-                            rx: raw,
+                self.record(name: name + " [wrapped]", tx: tx, rx: raw,
                             error: error?.localizedDescription ?? "")
-                done(response, sw2, error)
+                done(response, sw2)
             }
             return
         }
 
-        // Modo nativo: el byte de estado es el ultimo del paquete de respuesta.
         let packet = Data([ins]) + data
         tag.sendMiFareCommand(commandPacket: packet) { response, error in
-            self.record(name: name + " [native]",
-                        tx: packet,
-                        rx: response,
+            self.record(name: name + " [native]", tx: packet, rx: response,
                         error: error?.localizedDescription ?? "")
-            if response.isEmpty {
-                done(Data(), 0xFF, error)
-                return
-            }
-            let payload = response.dropLast()
-            let status = response.last ?? 0xFF
-            done(Data(payload), status, error)
+            let (payload, status) = self.splitStatus(response, mode: .native)
+            done(payload, status)
         }
     }
 
-    /// Igual que execute pero usando el modo ya elegido.
     private func run(_ tag: NFCMiFareTag,
                      ins: UInt8,
                      data: Data,
                      name: String,
-                     done: @escaping (Data, UInt8, Error?) -> Void) {
-        execute(tag, mode: mode == .unknown ? .native : mode, ins: ins, data: data, name: name, done: done)
+                     done: @escaping (Data, UInt8) -> Void) {
+        exchange(tag, mode: mode == .unknown ? .native : mode,
+                 ins: ins, data: data, name: name, done: done)
     }
 
-    /// Prueba ambos modos con GetVersion y decide.
-    private func probe(_ tag: NFCMiFareTag, done: @escaping (CommandMode) -> Void) {
-        execute(tag, mode: .native, ins: 0x60, data: Data(), name: "probe GetVersion") { p1, s1, e1 in
-            let nativeOK = (e1 == nil) && (s1 == 0x00 || s1 == 0xAF)
-            let nativeData = (e1 == nil) && !p1.isEmpty
-            self.execute(tag, mode: .wrapped, ins: 0x60, data: Data(), name: "probe GetVersion") { p2, s2, e2 in
-                let wrappedOK = (e2 == nil) && (s2 == 0x00 || s2 == 0xAF)
-                let wrappedData = (e2 == nil) && !p2.isEmpty
-                let chosen: CommandMode
-                if nativeOK {
-                    chosen = .native
-                } else if wrappedOK {
-                    chosen = .wrapped
-                } else if nativeData {
-                    chosen = .native
-                } else if wrappedData {
-                    chosen = .wrapped
-                } else {
-                    chosen = .unknown
-                }
-                done(chosen)
-            }
-        }
-    }
-
-    /// Ejecuta un comando siguiendo los frames 0xAF (ADDITIONAL_FRAME) hasta el final.
-    /// GetVersion necesita esto: una sola pasada solo devuelve 4 bytes.
-    private func runWithFrames(_ tag: NFCMiFareTag,
-                               ins: UInt8,
-                               data: Data,
-                               name: String,
-                               done: @escaping (Data) -> Void) {
+    /// Sigue los frames 0xAF hasta el final. Devuelve todo el payload acumulado.
+    private func runFrames(_ tag: NFCMiFareTag,
+                           mode explicitMode: CommandMode,
+                           ins: UInt8,
+                           data: Data,
+                           name: String,
+                           done: @escaping (Data, UInt8, Int) -> Void) {
         var accumulated = Data()
-        var frameIndex = 0
+        var frames = 0
         var finished = false
 
         func step(_ nextIns: UInt8, _ nextData: Data) {
             if finished { return }
-            let label = frameIndex == 0 ? name : "\(name) frame \(frameIndex)"
-            self.run(tag, ins: nextIns, data: nextData, name: label) { payload, status, error in
+            let label = frames == 0 ? name : "\(name) frame \(frames)"
+            exchange(tag, mode: explicitMode, ins: nextIns, data: nextData, name: label) { payload, status in
                 if finished { return }
                 accumulated.append(payload)
-                frameIndex += 1
-                if error != nil && payload.isEmpty {
-                    finished = true
-                    self.record(name: name + " [fin]", tx: Data(), rx: Data(), error: "abortado: \(statusName(status))")
-                    done(accumulated)
-                    return
-                }
-                if status == 0xAF && frameIndex < self.maxFrames {
+                frames += 1
+                if status == 0xAF && frames < self.maxFrames {
                     step(0xAF, Data())
                 } else {
                     finished = true
-                    done(accumulated)
+                    done(accumulated, status, frames)
                 }
             }
         }
@@ -277,31 +255,51 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
         let uid = tag.identifier.hex
         let historical = tag.historicalBytes?.hex
 
-        probe(tag) { chosen in
-            self.mode = chosen
-            self.setStatus("Comandos: \(chosen.rawValue). Leyendo GetVersion...")
+        setStatus("Probando modos de comando...")
 
-            self.runWithFrames(tag, ins: 0x60, data: Data(), name: "GetVersion") { version in
-                self.setStatus("GetVersion: \(version.count) bytes. Leyendo GetApplicationIDs...")
-
-                self.runWithFrames(tag, ins: 0x6A, data: Data(), name: "GetApplicationIDs") { appBytes in
-                    let apps = DesfireReader.parseAIDs(appBytes)
-                    self.setStatus("Aplicaciones: \(apps.count). Explorando archivos...")
-
-                    self.exploreApplications(tag, apps: apps, index: 0) {
-                        let scan = NFCScan(uid: uid,
-                                           family: "MIFARE DESFire",
-                                           historical_bytes: historical,
-                                           applications: apps,
-                                           transactions: self.transactions)
-                        self.finish(scan, session: session)
-                    }
-                }
+        // El sondeo ES el GetVersion: completa los frames y deja la tarjeta limpia.
+        // Si el sondeo nativo funciona, ya tenemos la version leida.
+        runFrames(tag, mode: .native, ins: 0x60, data: Data(), name: "GetVersion") { version, status, frames in
+            if !version.isEmpty {
+                self.mode = .native
+                self.setStatus("native OK (\(frames) frames, \(version.count) bytes). Leyendo aplicaciones...")
+                self.readApplications(tag, uid: uid, historical: historical, version: version, session: session)
+                return
+            }
+            // Plan B: APDUs envueltos con CLA 0x90.
+            self.runFrames(tag, mode: .wrapped, ins: 0x60, data: Data(), name: "GetVersion") { version2, _, frames2 in
+                self.mode = version2.isEmpty ? .unknown : .wrapped
+                self.setStatus("wrapped (\(frames2) frames, \(version2.count) bytes). Leyendo aplicaciones...")
+                self.readApplications(tag, uid: uid, historical: historical, version: version2, session: session)
             }
         }
     }
 
-    /// AIDs de 3 bytes en el payload ya sin byte de estado.
+    private func readApplications(_ tag: NFCMiFareTag,
+                                  uid: String,
+                                  historical: String?,
+                                  version: Data,
+                                  session: NFCTagReaderSession) {
+        runFrames(tag, mode: mode, ins: 0x6A, data: Data(), name: "GetApplicationIDs") { appBytes, status, _ in
+            let apps = DesfireReader.parseAIDs(appBytes)
+            if apps.isEmpty {
+                self.record(name: "GetApplicationIDs [vacio]",
+                            tx: Data([0x6A]), rx: appBytes,
+                            error: "sin aplicaciones, status final \(statusName(status))")
+            }
+            self.setStatus("Aplicaciones: \(apps.count). Explorando...")
+            self.exploreApplications(tag, apps: apps, index: 0) {
+                let scan = NFCScan(uid: uid,
+                                   family: "MIFARE DESFire",
+                                   historical_bytes: historical,
+                                   applications: apps,
+                                   transactions: self.transactions)
+                self.finish(scan, session: session)
+            }
+        }
+    }
+
+    /// AIDs de 3 bytes sobre el payload ya sin byte de estado.
     static func parseAIDs(_ data: Data) -> [String] {
         guard data.count >= 3 else { return [] }
         var result: [String] = []
@@ -324,8 +322,8 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
             exploreApplications(tag, apps: apps, index: index + 1, done: done)
             return
         }
-        run(tag, ins: 0x5A, data: aid, name: "SelectApplication \(aidHex)") { _, _, _ in
-            self.run(tag, ins: 0x6F, data: Data(), name: "GetFileIDs \(aidHex)") { payload, _, _ in
+        run(tag, ins: 0x5A, data: aid, name: "SelectApplication \(aidHex)") { _, _ in
+            self.run(tag, ins: 0x6F, data: Data(), name: "GetFileIDs \(aidHex)") { payload, _ in
                 self.exploreFiles(tag, aidHex: aidHex, fids: Array(payload), index: 0) {
                     self.exploreApplications(tag, apps: apps, index: index + 1, done: done)
                 }
@@ -340,12 +338,12 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                               done: @escaping () -> Void) {
         guard index < fids.count, index < maxFiles else { done(); return }
         let fid = fids[index]
-        let tagHex = String(format: "%02X", fid)
-        run(tag, ins: 0xF5, data: Data([fid]), name: "GetFileSettings \(aidHex) fid \(tagHex)") { _, _, _ in
+        let fidHex = String(format: "%02X", fid)
+        run(tag, ins: 0xF5, data: Data([fid]), name: "GetFileSettings \(aidHex) fid \(fidHex)") { _, _ in
             // ReadData: fid(1) + offset(3) + longitud(3)
             let request = Data([fid, 0x00, 0x00, 0x00, self.readLength, 0x00, 0x00])
             self.run(tag, ins: 0xBD, data: request,
-                     name: "ReadData \(aidHex) fid \(tagHex) off 0 len \(self.readLength)") { _, _, _ in
+                     name: "ReadData \(aidHex) fid \(fidHex) off 0 len \(self.readLength)") { _, _ in
                 self.exploreFiles(tag, aidHex: aidHex, fids: fids, index: index + 1, done: done)
             }
         }
