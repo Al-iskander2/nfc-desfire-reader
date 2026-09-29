@@ -1,0 +1,82 @@
+name: build-ipa
+
+# Compila la app iOS en un runner macOS de GitHub (Xcode ya instalado, gratis en
+# repos publicos), la firma con ldid + el entitlement NFC y sube el .ipa.
+# El resultado se instala en un iPhone 7 con TrollStore (iOS 15.4.1).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar xcodegen y ldid
+        run: |
+          brew install xcodegen
+          brew install ldid-procursus || brew install ldid
+          which ldid
+          xcodegen --version
+          xcodebuild -version
+
+      - name: Generar el proyecto Xcode
+        run: xcodegen generate
+
+      - name: Compilar (sin firma)
+        run: |
+          xcodebuild \
+            -project NFCDesfireReader.xcodeproj \
+            -scheme NFCDesfireReader \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CONFIGURATION_BUILD_DIR="$PWD/build/out" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tail -40
+
+      - name: Verificar el binario
+        run: |
+          APP="build/out/NFCDesfireReader.app"
+          test -d "$APP" || { echo "No se genero el .app"; exit 1; }
+          lipo -info "$APP/NFCDesfireReader"
+          echo "--- Info.plist relevante ---"
+          /usr/libexec/PlistBuddy -c "Print :NFCReaderUsageDescription" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity" "$APP/Info.plist"
+
+      - name: Firmar con ldid y empaquetar el .ipa
+        run: |
+          APP="build/out/NFCDesfireReader.app"
+          ENT="Supporting/NFCDesfireReader.entitlements"
+          echo "--- entitlements que se van a embeber ---"
+          cat "$ENT"
+          ldid -S"$ENT" "$APP/NFCDesfireReader"
+          echo "--- entitlements embebidos en el binario ---"
+          ldid -e "$APP/NFCDesfireReader"
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry NFCDesfireReader.ipa Payload
+          ls -lh NFCDesfireReader.ipa
+          unzip -l NFCDesfireReader.ipa | head -20
+
+      - name: Comprobar que el entitlement NFC esta dentro
+        run: |
+          APP="build/out/NFCDesfireReader.app"
+          if ldid -e "$APP/NFCDesfireReader" | grep -q "nfc.readersession.formats"; then
+            echo "OK: el entitlement NFC esta embebido"
+          else
+            echo "FALLO: no se encontro el entitlement NFC"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NFCDesfireReader-ipa
+          path: NFCDesfireReader.ipa
+          if-no-files-found: error

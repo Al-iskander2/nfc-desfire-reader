@@ -1,0 +1,71 @@
+name: NFCDesfireReader
+
+options:
+  bundleIdPrefix: com.aliskander
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    ENABLE_BITCODE: NO
+    ALWAYS_SEARCH_USER_PATHS: NO
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+  NFCDesfireReader:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_NAME: NFCDesfireReader
+        PRODUCT_BUNDLE_IDENTIFIER: com.aliskander.nfcdesfire
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        # iPhone 7 es arm64 (A10). Nada de arm64e.
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: NO
+        # La firma la hace ldid despues del build; el runner no tiene certificados.
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        DEVELOPMENT_TEAM: ""
+        SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+    info:
+      path: Supporting/Info.plist
+      properties:
+        CFBundleDisplayName: NFC DESFire
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NFCReaderUsageDescription: "Lee la tarjeta NFC para analisis local. Solo lectura, no modifica nada."
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+    entitlements:
+      path: Supporting/NFCDesfireReader.entitlements
+      properties:
+        com.apple.developer.nfc.readersession.formats:
+          - TAG
+
+# Scheme explicito y compartido: xcodegen no lo genera solo, y xcodebuild -scheme
+# falla en CI sin el (no hay Xcode GUI que lo autocree).
+schemes:
+  NFCDesfireReader:
+    build:
+      targets:
+        NFCDesfireReader: all
+    run:
+      config: Release
+    archive:
+      config: Release
+

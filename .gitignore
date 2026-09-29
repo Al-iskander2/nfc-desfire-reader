@@ -1,0 +1,14 @@
+# .gitignore
+# El proyecto Xcode es GENERADO por xcodegen a partir de project.yml. No se versiona.
+*.xcodeproj
+*.xcworkspace
+
+# Artefactos de build
+build/
+DerivedData/
+Payload/
+*.ipa
+*.dSYM
+
+# macOS
+.DS_Store
