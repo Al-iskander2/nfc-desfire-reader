@@ -38,6 +38,12 @@ targets:
         DEVELOPMENT_TEAM: ""
         SWIFT_OPTIMIZATION_LEVEL: "-Onone"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+        # Xcode 16 convierte por defecto el ejecutable en un stub que carga el codigo
+        # real desde NombreApp.debug.dylib. En un IPA sin firmar por Apple eso revienta:
+        # el dylib queda sin firma y dyld/AMFI lo rechazan. Lo desactivamos para tener
+        # un unico ejecutable autocontenido.
+        ENABLE_DEBUG_DYLIB: NO
+        ENABLE_PREVIEWS: NO
     info:
       path: Supporting/Info.plist
       properties:

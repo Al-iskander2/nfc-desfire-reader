@@ -68,6 +68,18 @@ jobs:
         run: |
           APP="build/out/NFCDesfireReader.app"
           ENT="Supporting/NFCDesfireReader.entitlements"
+
+          # Defensa: si aparece un .dylib, el ejecutable es un stub (ENABLE_DEBUG_DYLIB)
+          # y el bundle no arrancaria en el telefono. Mejor fallar aqui.
+          if ls "$APP"/*.dylib >/dev/null 2>&1; then
+            echo "FALLO: hay dylibs en el bundle, el ejecutable es un stub:"
+            ls -la "$APP"
+            exit 1
+          fi
+          echo "OK: bundle sin dylibs, ejecutable autocontenido"
+          ls -la "$APP"
+          ls -lh "$APP/NFCDesfireReader"
+
           echo "--- entitlements que se van a embeber ---"
           cat "$ENT"
           ldid -S"$ENT" "$APP/NFCDesfireReader"
@@ -78,7 +90,7 @@ jobs:
           cp -R "$APP" Payload/
           zip -qry NFCDesfireReader.ipa Payload
           ls -lh NFCDesfireReader.ipa
-          unzip -l NFCDesfireReader.ipa | head -20
+          unzip -l NFCDesfireReader.ipa
 
       - name: Comprobar que el entitlement NFC esta dentro
         run: |
