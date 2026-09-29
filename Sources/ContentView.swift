@@ -3,6 +3,7 @@ import UIKit
 
 struct ContentView: View {
     @ObservedObject var reader: DesfireReader
+    @State private var showAuthConfirm = false
 
     var body: some View {
         NavigationView {
@@ -34,6 +35,23 @@ struct ContentView: View {
                 .cornerRadius(10)
                 .disabled(reader.busy)
 
+                Button(action: { showAuthConfirm = true }) {
+                    Text("PROBAR CLAVE POR DEFECTO")
+                        .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .background(reader.busy ? Color.gray : Color.orange)
+                .foregroundColor(.white)
+                .cornerRadius(10)
+                .disabled(reader.busy)
+                .alert("¿Probar la clave por defecto?", isPresented: $showAuthConfirm) {
+                    Button("Cancelar", role: .cancel) { }
+                    Button("Probar", role: .destructive) { reader.startDefaultKeyProbe() }
+                } message: {
+                    Text("Se prueba la clave 00…00 UNA sola vez por cada clave del chip (0, 3, 4 y 13).\n\nCada clave tolera 3 fallos antes de bloquearse, así que esto gasta 1 de esos 3 en cada una. Si las claves están diversificadas por UID, que es lo habitual en una tarjeta de transporte, fallará.\n\nNo se escribe, ni se borra, ni se formatea nada. Solo lectura.")
+                }
+
                 Text(reader.status)
                     .font(.footnote)
                     .foregroundColor(.secondary)
@@ -62,7 +80,7 @@ struct ContentView: View {
 
                 Spacer(minLength: 0)
 
-                Text("Solo lectura: GetVersion, GetApplicationIDs, SelectApplication, GetFileIDs, GetFileSettings, ReadData. No autentica ni escribe nada.")
+                Text("LEER TARJETA explora sin autenticar nada. PROBAR CLAVE POR DEFECTO intenta, una sola vez por clave, el valor por defecto. Ninguna de las dos escribe: GetVersion, GetApplicationIDs, SelectApplication, GetFileIDs, GetFileSettings, GetKeySettings, ReadData y Authenticate.")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }

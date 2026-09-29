@@ -95,6 +95,17 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
     /// solo queremos ver el principio de cada archivo, no volcar tarjetas enteras.
     private let readChunk = 32
     private let maxReadBytes = 64
+    /// Tras autenticar se leen los archivos enteros: 1 KB cubre el mayor (960 bytes).
+    private let maxAuthReadBytes = 1024
+
+    /// Lo que se descubre al explorar, para poder releer despues de autenticar.
+    private var discoveredFIDs: [UInt8] = []
+    private var currentAIDHex = ""
+
+    /// Claves que se prueban con el valor por defecto, UNA sola vez cada una.
+    /// Son las que protegen los archivos (3, 4 y 13) mas la maestra de aplicacion (0).
+    /// Cada clave lleva su propio contador de fallos en el chip: 1 intento de 3.
+    static let defaultKeyCandidates: [UInt8] = [0, 3, 4, 13]
 
     /// Estados DESFire validos. Se usan para DEDUCIR donde va el byte de estado, porque
     /// CoreNFC no es consistente: en la primera respuesta de GetVersion el 0xAF vino
@@ -117,19 +128,31 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
 
     // MARK: Sesion NFC
 
-    func start() {
+    /// Que se hace cuando aparece una tarjeta.
+    private enum Task { case explore, probeDefaultKeys }
+    private var task: Task = .explore
+
+    func start() { begin(.explore) }
+
+    /// Sondeo de la clave por defecto. Solo se llama desde la interfaz, tras confirmar.
+    func startDefaultKeyProbe() { begin(.probeDefaultKeys) }
+
+    private func begin(_ newTask: Task) {
         guard NFCTagReaderSession.readingAvailable else {
             setStatus("Este dispositivo no soporta NFCTagReaderSession.")
             return
         }
         transactions = []
         mode = .unknown
+        task = newTask
         DispatchQueue.main.async {
             self.output = ""
             self.busy = true
         }
         session = NFCTagReaderSession(pollingOption: [.iso14443], delegate: self, queue: nil)
-        session?.alertMessage = "Acerca la tarjeta DESFire al telefono."
+        session?.alertMessage = newTask == .explore
+            ? "Acerca la tarjeta DESFire al telefono."
+            : "Acerca la tarjeta para probar la clave por defecto."
         session?.begin()
     }
 
@@ -161,16 +184,29 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                 session.invalidate(errorMessage: "La tarjeta no se presento como MIFARE.")
                 return
             }
-            self.inspect(mifare, session: session)
+            if self.task == .probeDefaultKeys {
+                self.runDefaultKeyProbe(mifare, session: session)
+            } else {
+                self.inspect(mifare, session: session)
+            }
         }
     }
 
     // MARK: Separacion del byte de estado
 
     /// Devuelve (payload, status) sin importar en que extremo venga el estado.
-    private func splitStatus(_ raw: Data, mode explicitMode: CommandMode) -> (Data, UInt8) {
+    ///
+    /// `expect` es el numero de bytes que se pidieron: si se conoce, el reparto es
+    /// inequivoco (1 de estado + los pedidos, y opcionalmente 8 de CMAC si la
+    /// comunicacion paso a MACed tras autenticar).
+    private func splitStatus(_ raw: Data, mode explicitMode: CommandMode,
+                             expect: Int? = nil) -> (Data, UInt8) {
         if raw.isEmpty { return (Data(), 0xFF) }
         if raw.count == 1 { return (Data(), raw.first!) }
+
+        if let n = expect, raw.count == n + 1 || raw.count == n + 9 {
+            return (Data(raw.dropFirst().prefix(n)), raw.first!)
+        }
 
         // En modo wrapped el APDU siempre devuelve SW1 SW2 al final (ya recortado aparte).
         guard explicitMode != .wrapped else {
@@ -201,6 +237,7 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                           ins: UInt8,
                           data: Data,
                           name: String,
+                          expect: Int? = nil,
                           done: @escaping (Data, UInt8) -> Void) {
         if explicitMode == .wrapped {
             let apdu = NFCISO7816APDU(instructionClass: 0x90,
@@ -225,7 +262,7 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
         tag.sendMiFareCommand(commandPacket: packet) { response, error in
             self.record(name: name + " [native]", tx: packet, rx: response,
                         error: error?.localizedDescription ?? "")
-            let (payload, status) = self.splitStatus(response, mode: .native)
+            let (payload, status) = self.splitStatus(response, mode: .native, expect: expect)
             done(payload, status)
         }
     }
@@ -234,9 +271,10 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                      ins: UInt8,
                      data: Data,
                      name: String,
+                     expect: Int? = nil,
                      done: @escaping (Data, UInt8) -> Void) {
         exchange(tag, mode: mode == .unknown ? .native : mode,
-                 ins: ins, data: data, name: name, done: done)
+                 ins: ins, data: data, name: name, expect: expect, done: done)
     }
 
     /// Sigue los frames 0xAF hasta el final. Devuelve todo el payload acumulado.
@@ -344,6 +382,8 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
         }
         run(tag, ins: 0x5A, data: aid, name: "SelectApplication \(aidHex)") { _, _ in
             self.run(tag, ins: 0x6F, data: Data(), name: "GetFileIDs \(aidHex)") { payload, _ in
+                self.discoveredFIDs = Array(payload)
+                self.currentAIDHex = aidHex
                 self.exploreFiles(tag, aidHex: aidHex, fids: Array(payload), index: 0) {
                     self.exploreApplications(tag, apps: apps, index: index + 1, done: done)
                 }
@@ -393,7 +433,7 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
                             UInt8((offset >> 8) & 0xFF),
                             UInt8(offset & 0xFF),
                             len, 0x00, 0x00])
-        run(tag, ins: 0xBD, data: request,
+        run(tag, ins: 0xBD, data: request, expect: Int(len),
             name: "ReadData \(aidHex) fid \(fidHex) off \(offset) len \(len)") { payload, status in
             if status != 0x00 || payload.isEmpty {
                 self.record(name: "ReadData \(aidHex) fid \(fidHex) [fin]",
@@ -405,6 +445,182 @@ final class DesfireReader: NSObject, ObservableObject, NFCTagReaderSessionDelega
             self.readFile(tag, aidHex: aidHex, fid: fid, fidHex: fidHex,
                           offset: offset + Int(len), limit: limit, done: done)
         }
+    }
+
+    // MARK: Sondeo de la clave por defecto (manual, con confirmacion)
+
+    private var probeUID = ""
+    private var probeHistorical: String?
+    private var probeApps: [String] = []
+
+    private func runDefaultKeyProbe(_ tag: NFCMiFareTag, session: NFCTagReaderSession) {
+        probeUID = tag.identifier.hex
+        probeHistorical = tag.historicalBytes?.hex
+        setStatus("Leyendo el chip...")
+
+        runFrames(tag, mode: .native, ins: 0x60, data: Data(), name: "GetVersion") { _, _, _ in
+            self.runFrames(tag, mode: .native, ins: 0x6A, data: Data(), name: "GetApplicationIDs") { appBytes, _, _ in
+                self.probeApps = DesfireReader.parseAIDs(appBytes)
+                guard let aidHex = self.probeApps.first,
+                      let aid = Data(hexString: aidHex), aid.count == 3 else {
+                    self.record(name: "Sondeo", tx: Data(), rx: Data(),
+                                error: "no hay aplicacion que sondear")
+                    self.finalizeProbe(session)
+                    return
+                }
+                self.run(tag, ins: 0x5A, data: aid, name: "SelectApplication \(aidHex)") { _, _ in
+                    self.run(tag, ins: 0x6F, data: Data(), name: "GetFileIDs \(aidHex)") { payload, _ in
+                        self.discoveredFIDs = Array(payload)
+                        self.currentAIDHex = aidHex
+                        self.readKeySettings(tag, session: session)
+                    }
+                }
+            }
+        }
+    }
+
+    /// GetKeySettings (0x45): dice el tipo de clave y cuantas hay. Es lo que decide si
+    /// se prueba algo. No modifica nada.
+    private func readKeySettings(_ tag: NFCMiFareTag, session: NFCTagReaderSession) {
+        let cmd = Data([0x45])
+        setStatus("Consultando el tipo de clave del chip...")
+        tag.sendMiFareCommand(commandPacket: cmd) { resp, err in
+            let (payload, _) = self.splitStatus(resp, mode: .native)
+            let bytes = [UInt8](payload)
+            // KeySettings2, bit 0x10 = claves AES. Los 4 bits bajos = numero de claves - 1.
+            let esAES = bytes.count >= 2 && (bytes[1] & 0x10) != 0
+            let nClaves = bytes.count >= 2 ? Int(bytes[1] & 0x0F) + 1 : 0
+            self.record(name: "GetKeySettings \(self.currentAIDHex) (AES=\(esAES), claves=\(nClaves))",
+                        tx: cmd, rx: resp, error: err?.localizedDescription ?? "")
+
+            guard err == nil, bytes.count >= 2 else {
+                self.setStatus("El chip no dio el tipo de clave. No se prueba nada a ciegas.")
+                self.finalizeProbe(session)
+                return
+            }
+            guard esAES else {
+                self.setStatus("El chip dice que sus claves NO son AES. No implementado: nada se prueba a ciegas.")
+                self.record(name: "Sondeo abortado", tx: Data(), rx: Data(),
+                            error: "el chip declara claves no-AES; no se intenta nada")
+                self.finalizeProbe(session)
+                return
+            }
+            self.probeKeys(tag, index: 0, session: session)
+        }
+    }
+
+    private func probeKeys(_ tag: NFCMiFareTag, index: Int, session: NFCTagReaderSession) {
+        let lista = DesfireReader.defaultKeyCandidates
+        guard index < lista.count else {
+            self.setStatus("Sondeo terminado: ninguna clave por defecto. La tarjeta queda intacta.")
+            self.record(name: "Sondeo terminado", tx: Data(), rx: Data(),
+                        error: "ninguna de las claves \(lista) tiene el valor por defecto")
+            self.finalizeProbe(session)
+            return
+        }
+        let keyNo = lista[index]
+        setStatus("Clave \(keyNo): intento unico con el valor por defecto (\(index + 1)/\(lista.count))...")
+        authenticateAES(tag, keyNo: keyNo, key: Data(count: 16)) { ok, _ in
+            if ok {
+                self.setStatus("CLAVE \(keyNo) ES LA POR DEFECTO. Leyendo los archivos enteros...")
+                self.readAllFiles(tag, index: 0) {
+                    self.probeKeys(tag, index: index + 1, session: session)
+                }
+            } else {
+                self.probeKeys(tag, index: index + 1, session: session)
+            }
+        }
+    }
+
+    /// AuthenticateAES (0xAA), protocolo de 3 pasos:
+    ///   1. PCD -> AA keyNo                       tarjeta -> E_K(RndB), 16 bytes
+    ///   2. PCD -> AF (E_K(RndA || RndB->1))      IV = el E_K(RndB) recibido
+    ///   3. tarjeta -> E_K(RndA->1)               IV = el ultimo bloque enviado
+    /// Se comprueba que el RndA rotado coincide. UN SOLO intento por clave: no se
+    /// reintenta, porque cada fallo gasta uno de los 3 que tolera la clave en el chip.
+    private func authenticateAES(_ tag: NFCMiFareTag, keyNo: UInt8, key: Data,
+                                 done: @escaping (Bool, Data?) -> Void) {
+        let label = "AuthenticateAES clave \(keyNo)"
+        let cmd1 = Data([0xAA, keyNo])
+        tag.sendMiFareCommand(commandPacket: cmd1) { resp1, err1 in
+            self.record(name: label + " paso 1", tx: cmd1, rx: resp1,
+                        error: err1?.localizedDescription ?? "")
+            // El estado va al principio en este stack (establecido con datos reales).
+            // Si aqui no hay un 0x00, se aborta SIN llegar a intentar la clave, que es
+            // el modo de fallo seguro.
+            guard err1 == nil, resp1.count >= 17, resp1.first == 0x00 else {
+                self.record(name: label + " abortado", tx: Data(), rx: resp1,
+                            error: "respuesta inesperada; no se ha intentado ninguna clave")
+                done(false, nil)
+                return
+            }
+            let encRndB = Data(resp1.dropFirst().prefix(16))
+            guard let rndB = DesfireCrypto.aesCBC(encRndB, key: key, iv: Data(count: 16), encrypt: false) else {
+                done(false, nil); return
+            }
+            let rndA = DesfireCrypto.randomBytes(16)
+            let bloque = rndA + DesfireCrypto.rotateLeft(rndB)
+            guard let encBloque = DesfireCrypto.aesCBC(bloque, key: key, iv: encRndB, encrypt: true) else {
+                done(false, nil); return
+            }
+            let cmd2 = Data([0xAF]) + encBloque
+            // El IV del paso 3 es el ULTIMO BLOQUE de 16 bytes del cifrado enviado, no
+            // los 32 bytes enteros. Confundirlo hace que la verificacion falle aunque la
+            // clave sea correcta: lo cazo el autotest de criptografia.
+            let ivPaso3 = Data(encBloque.suffix(16))
+            tag.sendMiFareCommand(commandPacket: cmd2) { resp2, err2 in
+                self.record(name: label + " paso 2", tx: cmd2, rx: resp2,
+                            error: err2?.localizedDescription ?? "")
+                guard err2 == nil, resp2.count >= 17 else { done(false, nil); return }
+                // La respuesta son 16 bytes cifrados + estado. Como el resultado es
+                // comprobable, se prueban los dos extremos y se acepta el que verifique:
+                // no hace falta adivinar donde esta el estado.
+                let candidatos = [Data(resp2.dropFirst().prefix(16)),
+                                  Data(resp2.dropLast().suffix(16))]
+                let esperado = DesfireCrypto.rotateLeft(rndA)
+                for cand in candidatos {
+                    if let claro = DesfireCrypto.aesCBC(cand, key: key, iv: ivPaso3, encrypt: false),
+                       claro == esperado {
+                        self.record(name: label + " AUTENTICADO", tx: Data(), rx: Data(),
+                                    error: "la clave \(keyNo) tiene el valor por defecto")
+                        done(true, DesfireCrypto.sessionKey(rndA: rndA, rndB: rndB))
+                        return
+                    }
+                }
+                self.record(name: label + " fallo", tx: Data(), rx: resp2,
+                            error: "RndA no cuadra: la clave \(keyNo) NO es la por defecto")
+                done(false, nil)
+            }
+        }
+    }
+
+    /// Relee todos los archivos conocidos sin el tope de 64 bytes de la exploracion.
+    private func readAllFiles(_ tag: NFCMiFareTag, index: Int, done: @escaping () -> Void) {
+        guard index < discoveredFIDs.count else { done(); return }
+        let fid = discoveredFIDs[index]
+        let fidHex = String(format: "%02X", fid)
+        run(tag, ins: 0xF5, data: Data([fid]),
+            name: "GetFileSettings (post-auth) \(currentAIDHex) fid \(fidHex)") { settings, _ in
+            let bytes = [UInt8](settings)
+            var size = 0
+            if bytes.count >= 7 {
+                size = Int(bytes[4]) | (Int(bytes[5]) << 8) | (Int(bytes[6]) << 16)
+            }
+            let limit = min(size, self.maxAuthReadBytes)
+            self.readFile(tag, aidHex: self.currentAIDHex, fid: fid, fidHex: fidHex,
+                          offset: 0, limit: limit) {
+                self.readAllFiles(tag, index: index + 1, done: done)
+            }
+        }
+    }
+
+    private func finalizeProbe(_ session: NFCTagReaderSession) {
+        let scan = NFCScan(uid: probeUID,
+                           family: "MIFARE DESFire",
+                           historical_bytes: probeHistorical,
+                           applications: probeApps,
+                           transactions: transactions)
+        finish(scan, session: session)
     }
 
     // MARK: Salida y envio

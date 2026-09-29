@@ -44,6 +44,8 @@ targets:
         # un unico ejecutable autocontenido.
         ENABLE_DEBUG_DYLIB: NO
         ENABLE_PREVIEWS: NO
+        # CommonCrypto (AES-CBC) no es un modulo importable: entra por cabecera puente.
+        SWIFT_OBJC_BRIDGING_HEADER: Supporting/Bridging-Header.h
     info:
       path: Supporting/Info.plist
       properties:
